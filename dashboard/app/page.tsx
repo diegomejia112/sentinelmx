@@ -38,7 +38,8 @@ export default function SentinelDashboard() {
   const connect = useCallback(() => {
     esRef.current?.close();
     setConn('connecting');
-    const es = new EventSource('http://localhost:8080/api/events');
+    const API = process.env.NEXT_PUBLIC_API_URL || 'http://94.72.118.12:8080';
+    const es = new EventSource(`${API}/api/events`);
     esRef.current = es;
     es.onopen = () => setConn('connected');
     es.onmessage = (e) => {
