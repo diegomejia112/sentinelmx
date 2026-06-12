@@ -21,7 +21,7 @@ ssh "$VPS" "
   fi
 
   # Construir binario directamente (sin Docker si no está disponible)
-  go build -o sentinelmx-agent ./agent/...
+  go build -buildvcs=false -o sentinelmx-agent ./agent/main.go
 
   # Crear servicio systemd para que arranque automático
   cat > /etc/systemd/system/sentinelmx.service << 'EOF'
