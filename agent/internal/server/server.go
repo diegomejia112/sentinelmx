@@ -9,6 +9,8 @@ import (
 	"sync"
 	"time"
 
+	"github.com/diegomejia11/sentinelmx/agent/internal/procmon"
+	"github.com/diegomejia11/sentinelmx/agent/internal/storage"
 	"github.com/diegomejia11/sentinelmx/agent/internal/telemetry"
 )
 
@@ -30,68 +32,76 @@ func (as *AlertStore) Add(a Alert) {
 	defer as.mu.Unlock()
 	as.alerts[as.index] = a
 	as.index = (as.index + 1) % 100
-	if as.count < 100 {
-		as.count++
-	}
+	if as.count < 100 { as.count++ }
 }
 
 func (as *AlertStore) GetAll() []Alert {
 	as.mu.RLock()
 	defer as.mu.RUnlock()
-	result := make([]Alert, 0, as.count)
-	if as.count == 0 {
-		return result
-	}
+	if as.count == 0 { return []Alert{} }
+	result := make([]Alert, as.count)
 	start := (as.index - as.count + 100) % 100
 	for i := 0; i < as.count; i++ {
-		result = append(result, as.alerts[(start+i)%100])
+		result[i] = as.alerts[(start+i)%100]
 	}
 	return result
 }
 
 type Server struct {
 	store    *AlertStore
+	db       *storage.DB
 	port     int
 	alertsCh chan Alert
+
+	mu          sync.RWMutex
+	processes   []procmon.ProcessInfo
+	connSummary map[string]int
 }
 
-func NewServer(port int) *Server {
+func NewServer(port int, db *storage.DB) *Server {
 	return &Server{
-		store:    &AlertStore{},
-		port:     port,
-		alertsCh: make(chan Alert, 50),
+		store:       &AlertStore{},
+		db:          db,
+		port:        port,
+		alertsCh:    make(chan Alert, 50),
+		connSummary: map[string]int{},
 	}
 }
 
-// AddAlert permite que el monitor de telemetría inyecte alertas al servidor
 func (s *Server) AddAlert(msg, severity string) {
 	a := Alert{Message: msg, Timestamp: time.Now(), Severity: severity}
 	s.store.Add(a)
 	select {
 	case s.alertsCh <- a:
-	default: // no bloquear si no hay suscriptores
+	default:
 	}
+}
+
+func (s *Server) UpdateProcesses(procs []procmon.ProcessInfo) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.processes = procs
+}
+
+func (s *Server) UpdateConnections(summary map[string]int) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.connSummary = summary
 }
 
 func cors(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Access-Control-Allow-Origin", "*")
-		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+		w.Header().Set("Access-Control-Allow-Methods", "GET, OPTIONS")
 		w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
-		if r.Method == http.MethodOptions {
-			w.WriteHeader(http.StatusOK)
-			return
-		}
+		if r.Method == http.MethodOptions { w.WriteHeader(http.StatusOK); return }
 		next.ServeHTTP(w, r)
 	})
 }
 
 func (s *Server) handleMetrics(w http.ResponseWriter, r *http.Request) {
 	m, err := telemetry.CollectMetrics()
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
-	}
+	if err != nil { http.Error(w, err.Error(), 500); return }
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(m)
 }
@@ -101,12 +111,30 @@ func (s *Server) handleAlerts(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(s.store.GetAll())
 }
 
+func (s *Server) handleHistory(w http.ResponseWriter, r *http.Request) {
+	records, err := s.db.GetMetrics(120) // última hora (30s interval)
+	if err != nil { http.Error(w, err.Error(), 500); return }
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(records)
+}
+
+func (s *Server) handleProcesses(w http.ResponseWriter, r *http.Request) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(s.processes)
+}
+
+func (s *Server) handleNetwork(w http.ResponseWriter, r *http.Request) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(s.connSummary)
+}
+
 func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
 	flusher, ok := w.(http.Flusher)
-	if !ok {
-		http.Error(w, "streaming not supported", http.StatusInternalServerError)
-		return
-	}
+	if !ok { http.Error(w, "streaming not supported", 500); return }
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "keep-alive")
@@ -117,14 +145,10 @@ func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
 
 	for {
 		select {
-		case <-ctx.Done():
-			return
+		case <-ctx.Done(): return
 		case <-ticker.C:
 			m, err := telemetry.CollectMetrics()
-			if err != nil {
-				continue
-			}
-			// Formato que el dashboard espera
+			if err != nil { continue }
 			payload := map[string]any{
 				"type": "system_metrics",
 				"cpu":  m.CPUUsagePercent,
@@ -150,15 +174,14 @@ func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) Start(ctx context.Context) error {
 	mux := http.NewServeMux()
-	mux.HandleFunc("/api/metrics", s.handleMetrics)
-	mux.HandleFunc("/api/alerts", s.handleAlerts)
-	mux.HandleFunc("/api/events", s.handleEvents)
+	mux.HandleFunc("/api/metrics",   s.handleMetrics)
+	mux.HandleFunc("/api/alerts",    s.handleAlerts)
+	mux.HandleFunc("/api/history",   s.handleHistory)
+	mux.HandleFunc("/api/processes", s.handleProcesses)
+	mux.HandleFunc("/api/network",   s.handleNetwork)
+	mux.HandleFunc("/api/events",    s.handleEvents)
 
-	srv := &http.Server{
-		Addr:    fmt.Sprintf(":%d", s.port),
-		Handler: cors(mux),
-	}
-
+	srv := &http.Server{Addr: fmt.Sprintf(":%d", s.port), Handler: cors(mux)}
 	log.Printf("SentinelMX API en http://localhost:%d", s.port)
 
 	errCh := make(chan error, 1)
