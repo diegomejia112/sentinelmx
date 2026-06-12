@@ -67,7 +67,7 @@ func DetectSuspicious(procs []ProcessInfo) []string {
 		if p.Hidden {
 			alerts = append(alerts, fmt.Sprintf("Hidden process detected PID %d", p.PID))
 		}
-		if p.MemRSSKB > 512000 {
+		if p.MemRSSKB > 1048576 { // 1GB — evitar falsos positivos con Java/Docker en producción
 			alerts = append(alerts, fmt.Sprintf("High memory process: %s (%.0f MB)", p.Name, float64(p.MemRSSKB)/1024))
 		}
 	}

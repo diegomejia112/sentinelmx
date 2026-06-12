@@ -9,6 +9,7 @@ import (
 	"strings"
 )
 
+
 type Connection struct {
 	LocalAddr  string `json:"local"`
 	RemoteAddr string `json:"remote"`
@@ -85,6 +86,20 @@ func isPrivateIP(addr string) bool {
 
 var knownPorts = map[int]bool{80: true, 443: true, 22: true, 3306: true, 3000: true, 3001: true, 8080: true, 5432: true}
 
+// whitelistedIPs son IPs de administración propias — no generar alertas
+var whitelistedIPs = map[string]bool{}
+
+func init() {
+	// Cargar whitelist desde variable de entorno SENTINELMX_WHITELIST_IPS
+	// Formato: "1.2.3.4,5.6.7.8"
+	wl := os.Getenv("SENTINELMX_WHITELIST_IPS")
+	if wl != "" {
+		for _, ip := range strings.Split(wl, ",") {
+			whitelistedIPs[strings.TrimSpace(ip)] = true
+		}
+	}
+}
+
 func DetectSuspicious(conns []Connection) []string {
 	var alerts []string
 	established := 0
@@ -94,11 +109,12 @@ func DetectSuspicious(conns []Connection) []string {
 		established++
 		host, _, _ := net.SplitHostPort(c.RemoteAddr)
 		ipCount[host]++
-		if !isPrivateIP(c.RemoteAddr) {
+		if !isPrivateIP(c.RemoteAddr) && !whitelistedIPs[host] {
 			_, portStr, err := net.SplitHostPort(c.RemoteAddr)
 			if err == nil {
 				port, _ := strconv.Atoi(portStr)
-				if !knownPorts[port] {
+				// Ignorar conexiones SSH entrantes vistas como salientes (bug conocido /proc/net/tcp)
+				if !knownPorts[port] && port != 22 {
 					alerts = append(alerts, fmt.Sprintf("Suspicious outbound: %s → port %d", host, port))
 				}
 			}
