@@ -1,0 +1,26 @@
+version: "3.9"
+
+# Red completamente aislada — NO toca Cedecopy ni ningún otro servicio
+networks:
+  sentinelmx-net:
+    driver: bridge
+    name: sentinelmx-net
+
+services:
+  agent:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.agent
+    container_name: sentinelmx-agent
+    restart: unless-stopped
+    # Acceso a /proc del host para leer métricas reales del servidor
+    pid: "host"
+    volumes:
+      - /proc:/proc:ro      # solo lectura — nunca escribe al host
+    networks:
+      - sentinelmx-net
+    environment:
+      - TELEGRAM_TOKEN=${TELEGRAM_TOKEN:-}
+      - TELEGRAM_CHAT_ID=${TELEGRAM_CHAT_ID:-}
+      - MONITOR_INTERVAL=${MONITOR_INTERVAL:-5s}
+    # Sin puertos expuestos por ahora — el agente solo lee y alerta

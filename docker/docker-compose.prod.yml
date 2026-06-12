@@ -1,0 +1,34 @@
+version: "3.9"
+
+networks:
+  sentinelmx-net:
+    driver: bridge
+    name: sentinelmx-net
+
+services:
+  agent:
+    image: sentinelmx-agent:latest
+    container_name: sentinelmx-agent
+    restart: unless-stopped
+    pid: "host"
+    volumes:
+      - /proc:/proc:ro
+    networks:
+      - sentinelmx-net
+    ports:
+      - "8080:8080"
+    environment:
+      - MONITOR_INTERVAL=${MONITOR_INTERVAL:-5s}
+
+  dashboard:
+    image: sentinelmx-dashboard:latest
+    container_name: sentinelmx-dashboard
+    restart: unless-stopped
+    networks:
+      - sentinelmx-net
+    ports:
+      - "3000:3000"
+    depends_on:
+      - agent
+    environment:
+      - NEXT_PUBLIC_API_URL=http://agent:8080
