@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"os"
 	"sync"
 	"time"
 
@@ -51,18 +52,26 @@ type Server struct {
 	store    *AlertStore
 	db       *storage.DB
 	port     int
+	apiKey   string
 	alertsCh chan Alert
 
 	mu          sync.RWMutex
 	processes   []procmon.ProcessInfo
 	connSummary map[string]int
+	sseClients  int
 }
 
 func NewServer(port int, db *storage.DB) *Server {
+	apiKey := os.Getenv("SENTINELMX_API_KEY")
+	if apiKey == "" {
+		apiKey = "changeme-set-SENTINELMX_API_KEY"
+		log.Println("WARNING: SENTINELMX_API_KEY not set — using insecure default")
+	}
 	return &Server{
 		store:       &AlertStore{},
 		db:          db,
 		port:        port,
+		apiKey:      apiKey,
 		alertsCh:    make(chan Alert, 50),
 		connSummary: map[string]int{},
 	}
@@ -89,11 +98,34 @@ func (s *Server) UpdateConnections(summary map[string]int) {
 	s.connSummary = summary
 }
 
+// requireAPIKey valida el token en header X-API-Key o query param api_key
+func (s *Server) requireAPIKey(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		key := r.Header.Get("X-API-Key")
+		if key == "" {
+			key = r.URL.Query().Get("api_key")
+		}
+		if key != s.apiKey {
+			http.Error(w, "unauthorized", http.StatusUnauthorized)
+			return
+		}
+		next(w, r)
+	}
+}
+
 func cors(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Access-Control-Allow-Origin", "*")
+		// CORS restringido — solo el dashboard propio
+		origin := r.Header.Get("Origin")
+		allowed := map[string]bool{
+			"http://localhost:3000":        true,
+			"http://94.72.118.12:3000":     true,
+		}
+		if allowed[origin] {
+			w.Header().Set("Access-Control-Allow-Origin", origin)
+		}
 		w.Header().Set("Access-Control-Allow-Methods", "GET, OPTIONS")
-		w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
+		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, X-API-Key")
 		if r.Method == http.MethodOptions { w.WriteHeader(http.StatusOK); return }
 		next.ServeHTTP(w, r)
 	})
@@ -132,7 +164,24 @@ func (s *Server) handleNetwork(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(s.connSummary)
 }
 
+const maxSSEClients = 20
+
 func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
+	// Rate limit: máximo 20 clientes SSE simultáneos
+	s.mu.Lock()
+	if s.sseClients >= maxSSEClients {
+		s.mu.Unlock()
+		http.Error(w, "too many clients", http.StatusTooManyRequests)
+		return
+	}
+	s.sseClients++
+	s.mu.Unlock()
+	defer func() {
+		s.mu.Lock()
+		s.sseClients--
+		s.mu.Unlock()
+	}()
+
 	flusher, ok := w.(http.Flusher)
 	if !ok { http.Error(w, "streaming not supported", 500); return }
 	w.Header().Set("Content-Type", "text/event-stream")
@@ -174,14 +223,26 @@ func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) Start(ctx context.Context) error {
 	mux := http.NewServeMux()
-	mux.HandleFunc("/api/metrics",   s.handleMetrics)
-	mux.HandleFunc("/api/alerts",    s.handleAlerts)
-	mux.HandleFunc("/api/history",   s.handleHistory)
-	mux.HandleFunc("/api/processes", s.handleProcesses)
-	mux.HandleFunc("/api/network",   s.handleNetwork)
-	mux.HandleFunc("/api/events",    s.handleEvents)
+	// Todos los endpoints requieren API key
+	mux.HandleFunc("/api/metrics",   s.requireAPIKey(s.handleMetrics))
+	mux.HandleFunc("/api/alerts",    s.requireAPIKey(s.handleAlerts))
+	mux.HandleFunc("/api/history",   s.requireAPIKey(s.handleHistory))
+	mux.HandleFunc("/api/processes", s.requireAPIKey(s.handleProcesses))
+	mux.HandleFunc("/api/network",   s.requireAPIKey(s.handleNetwork))
+	mux.HandleFunc("/api/events",    s.requireAPIKey(s.handleEvents))
+	// Health check público (sin datos sensibles)
+	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprintf(w, `{"status":"ok","version":"0.2"}`)
+	})
 
-	srv := &http.Server{Addr: fmt.Sprintf(":%d", s.port), Handler: cors(mux)}
+	srv := &http.Server{
+		Addr:         fmt.Sprintf(":%d", s.port),
+		Handler:      cors(mux),
+		ReadTimeout:  10 * time.Second,
+		WriteTimeout: 0, // 0 para SSE (streaming no tiene timeout)
+		IdleTimeout:  60 * time.Second,
+	}
 	log.Printf("SentinelMX API en http://localhost:%d", s.port)
 
 	errCh := make(chan error, 1)

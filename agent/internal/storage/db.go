@@ -36,7 +36,7 @@ func NewDB(path string) (*DB, error) {
 	if _, err := os.Stat(path); os.IsNotExist(err) {
 		empty := dbFile{Metrics: []MetricRecord{}, Alerts: []AlertRecord{}}
 		data, _ := json.MarshalIndent(empty, "", "  ")
-		if err := os.WriteFile(path, data, 0644); err != nil {
+		if err := os.WriteFile(path, data, 0600); err != nil {
 			return nil, err
 		}
 	}
@@ -60,7 +60,7 @@ func (db *DB) readFile() (*dbFile, error) {
 func (db *DB) writeFile(f *dbFile) error {
 	data, err := json.MarshalIndent(f, "", "  ")
 	if err != nil { return err }
-	return os.WriteFile(db.path, data, 0644)
+	return os.WriteFile(db.path, data, 0600)
 }
 
 func (db *DB) SaveMetric(m MetricRecord) error {
